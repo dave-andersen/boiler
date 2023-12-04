@@ -62,14 +62,6 @@ async def main():
         await client.connect()
         assert client.connected
 
-        #outdoor_temp = await read_datafield(client, df_outdoor_temp)
-        #boiler_temp = await read_datafield(client, df_output_temp)
-        #boiler_status = await read_datafield(client, df_boiler_status)
-        #config = [await read_datafield(client, field) for field in [df_config_supply_max, df_config_supply_min, df_config_odr_max, df_config_odr_min]]
-        #boiler_on = boiler_status & 0x01
-        #boiler_on = "on" if boiler_on else "off"
-        #print(f"outdoor temp: {outdoor_temp} boiler temp: {boiler_temp} boiler is {boiler_on}")
-        #print("Config", config)
         status = { df.name : await read_datafield(client, df) for df in datafields }
         status["time"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat()
         json.dump(status, f)
