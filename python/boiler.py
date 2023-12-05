@@ -7,7 +7,7 @@ import time
 
 datafields = []
 
-SERIAL="/dev/serial0"
+SERIAL = "/dev/serial0"
 DEVICE = 250
 
 
@@ -25,7 +25,9 @@ class DataField:
 df_output_temp = DataField("output_temp", 0x9106, 1, "uint8")
 df_boiler_target_temp = DataField("boiler_target_temp", 0x9109, 1, "uint8")
 df_boiler_status = DataField("boiler status", 0x9105, 1, "uint8")
-df_outdoor_temp = DataField("outdoor_temp", 0x9112, 1, "uint8", degree_wrap=True) # note negative handling
+df_outdoor_temp = DataField(
+    "outdoor_temp", 0x9112, 1, "uint8", degree_wrap=True
+)  # note negative handling
 df_config_supply_max = DataField("supply_max", 0x9120, 1, "uint8")
 df_config_supply_min = DataField("supply_min", 0x9121, 1, "uint8")
 df_config_odr_max = DataField("odr_max", 0x9122, 1, "uint8")
@@ -38,14 +40,14 @@ df_flue_temp = DataField("flue_temp_1", 0x918C, 1, "uint8")
 df_supply_temp = DataField("local_supply_temp", 0x918D, 1, "uint8")
 df_return_temp = DataField("local_return_temp", 0x9196, 1, "uint8")
 df_modulation_rate = DataField("boiler_modulation_rate", 0x9232, 1, "uint8")
-
+df_config_od_adjust = DataField("outdoor_temp_adjust", 0x9166, 1, "uint8")
 
 
 async def read_datafield(client, datafield):
     rr = await client.read_holding_registers(
         datafield.address, datafield.length, slave=DEVICE
     )
-    #print(f"{datafield.name}: ", rr.registers)
+    # print(f"{datafield.name}: ", rr.registers)
     v = rr.registers[0]
     if datafield.degree_wrap and v > 232:
         v = v - 256
@@ -54,24 +56,38 @@ async def read_datafield(client, datafield):
 
 async def main():
     with open("log.json", "a") as f:
-      while True:
-        client = pymodbus.client.AsyncModbusSerialClient(
-            port=SERIAL, baudrate=19200, stopbits=1, parity="N"
-        )
-    
-        await client.connect()
-        assert client.connected
+        while True:
+            try:
+                client = pymodbus.client.AsyncModbusSerialClient(
+                    port=SERIAL, baudrate=19200, stopbits=1, parity="N"
+                )
 
-        status = { df.name : await read_datafield(client, df) for df in datafields }
-        status["time"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat()
-        json.dump(status, f)
-        f.write("\n")
-        f.flush()
-    
+                await client.connect()
+                assert client.connected
 
-        client.close()
-        time.sleep(60)
+                # outdoor_temp = await read_datafield(client, df_outdoor_temp)
+                # boiler_temp = await read_datafield(client, df_output_temp)
+                # boiler_status = await read_datafield(client, df_boiler_status)
+                # config = [await read_datafield(client, field) for field in [df_config_supply_max, df_config_supply_min, df_config_odr_max, df_config_odr_min]]
+                # boiler_on = boiler_status & 0x01
+                # boiler_on = "on" if boiler_on else "off"
+                # print(f"outdoor temp: {outdoor_temp} boiler temp: {boiler_temp} boiler is {boiler_on}")
+                # print("Config", config)
+                status = {
+                    df.name: await read_datafield(client, df) for df in datafields
+                }
+                status["time"] = (
+                    datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+                )
+                json.dump(status, f)
+                f.write("\n")
+                f.flush()
+
+                client.close()
+            except Exception as e:
+                print("Exception, ignoring: ", e)
+                pass
+            time.sleep(60)
 
 
 asyncio.run(main())
-
