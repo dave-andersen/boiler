@@ -26,8 +26,14 @@ last_time = None
 
 with open("log.json") as f:
     for line in f:
+        if not line.startswith("{"):
+            continue
         j = json.loads(line)
-        dt = datetime.datetime.strptime(j["time"], "%Y-%m-%dT%H:%M:%S")
+        timestr = j["time"].split(".")[0]
+        try:
+            dt = datetime.datetime.strptime(timestr, "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            dt = datetime.datetime.strptime(timestr, "%Y-%m-%d %H:%M:%S") # 2023-12-06 13:02:08.627029146
         if (now - dt).total_seconds() > 60 * 60 * 24:
             continue
         print(
