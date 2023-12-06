@@ -139,10 +139,10 @@ async fn getreg(
 ) -> Result<u16, Box<dyn std::error::Error>> {
     tokio::select! {
         _ = timeout() => {
-            return Err("Timeout".into());
+            Err("Timeout".into())
         }
         r = ctx.read_holding_registers(field.into(), 1) => {
-            return Ok(r?[0]);
+            Ok(r?[0])
         }
     }
 }
@@ -154,11 +154,11 @@ async fn setreg(
 ) -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         _ = timeout() => {
-            return Err("Timeout".into());
+            Err("Timeout".into())
         }
         v = ctx.write_single_register(field.into(), value) => {
             v?;
-            return Ok(());
+            Ok(())
         }
     }
 }
