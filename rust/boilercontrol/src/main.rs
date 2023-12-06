@@ -1,9 +1,8 @@
 use clap::Parser;
-use tokio_modbus::prelude::{Reader, Writer};
 use serde::Serialize;
-
-const SERIAL: &str = "/dev/serial0";
-const ADDRESS: u8 = 250;
+use std::io::Write;
+use tokio_modbus::prelude::{Reader, Writer};
+use reqwest::Client;
 
 const REAL_SUPPLY_MIN: i32 = 85;
 const REAL_SUPPLY_MAX: i32 = 171;
@@ -11,6 +10,34 @@ const REAL_ODR_MAX: i32 = 63;
 const REAL_ODR_MIN: i32 = -14;
 const MAX_TEMP_DELTA: i32 = 6;
 
+#[derive(Parser, Debug)]
+struct Opts {
+    /// Serial device to use
+    #[arg(short, long, default_value = "/dev/serial0")]
+    serial: String,
+
+    /// Serial port speed
+    #[arg(long, default_value = "19200")]
+    serial_speed: u32,
+
+    /// Modbus address of the boiler
+    #[arg(short, long, default_value = "250")]
+    address: u8,
+
+    /// Enable control of the boiler
+    #[arg(short, long)]
+    control: bool,
+
+    /// Temperature sensor IP address
+    #[arg(long, default_value = "192.168.49.11")]
+    sensor_ip: String,
+
+    /// Emit verbose output
+    #[arg(short, long)]
+    verbose: bool,
+}
+
+// Modbus registers, specific to Weil-Mclain Evergreen
 #[allow(dead_code)]
 enum BoilerField {
     OutputTemp = 0x9106,
@@ -54,9 +81,12 @@ struct BoilerInfo {
     boiler_modulation_rate: u16,
     outdoor_temp_adjust: u16,
     max_rate: u16,
+    indoor_temp: Option<f32>,
 }
 
-async fn get_full_boiler_info(ctx: &mut tokio_modbus::client::Context) -> Result<BoilerInfo, Box<dyn std::error::Error>> {
+async fn get_full_boiler_info(
+    ctx: &mut tokio_modbus::client::Context,
+) -> Result<BoilerInfo, Box<dyn std::error::Error>> {
     let output_temp = getreg(ctx, BoilerField::OutputTemp).await?;
     let boiler_target_temp = getreg(ctx, BoilerField::BoilerTargetTemp).await?;
     let boiler_status = getreg(ctx, BoilerField::BoilerStatus).await?;
@@ -96,13 +126,13 @@ async fn get_full_boiler_info(ctx: &mut tokio_modbus::client::Context) -> Result
         boiler_modulation_rate,
         outdoor_temp_adjust,
         max_rate,
+        indoor_temp: None,
     })
 }
 
-
-impl Into<u16> for BoilerField {
-    fn into(self) -> u16 {
-        self as u16
+impl From<BoilerField> for u16 {
+    fn from(val: BoilerField) -> Self {
+        val as u16
     }
 }
 
@@ -125,8 +155,9 @@ async fn timeout() {
 
 #[tokio::main]
 async fn main() {
+    let opts: Opts = Opts::parse();
     loop {
-        if let Err(e) = control_loop().await {
+        if let Err(e) = control_loop(&opts).await {
             eprintln!("Error: {}", e);
         }
         tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
@@ -163,44 +194,101 @@ async fn setreg(
     }
 }
 
-async fn control_loop() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(serde::Deserialize)]
+struct TempResponse {
+    temp: f32, // in C
+}
+
+async fn get_indoor_temp(opts: &Opts) -> Result<f32, Box<dyn std::error::Error>> {
+    let client = Client::new();
+    // Build a request with a 1 second timeout
+    let req = client
+        .get(format!("http://{}/", opts.sensor_ip))
+        .timeout(std::time::Duration::from_secs(1));
+    let resp = req.send().await?;
+    // unmarshal from json TempResponse
+    let resp: TempResponse = resp.json().await?;
+    Ok(resp.temp)
+}
+
+async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
     use tokio_serial::SerialStream;
 
     use tokio_modbus::prelude::*;
 
-    let slave = Slave(ADDRESS);
+    let slave = Slave(opts.address);
 
-    let builder = tokio_serial::new(SERIAL, 19200)
+    let builder = tokio_serial::new(&opts.serial, opts.serial_speed)
         .parity(tokio_serial::Parity::None)
         .stop_bits(tokio_serial::StopBits::One)
         .timeout(std::time::Duration::from_millis(1000));
     let port = SerialStream::open(&builder).unwrap();
 
     let mut ctx = rtu::attach_slave(port, slave);
-    // only exit this loop if we have an error and need to restart
+
     loop {
-        let info = get_full_boiler_info(&mut ctx).await?;
+        let indoor_temp = get_indoor_temp(&opts).await.ok();
+        let mut info = get_full_boiler_info(&mut ctx).await?;
+        info.indoor_temp = indoor_temp;
         let info_json = serde_json::to_string(&info)?;
-        println!("{info_json}");
+        // Log this to log.json
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("log.json")
+        {
+            file.write_all(info_json.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
         if info.boiler_status != 0 {
-            let calculated_target = calculate_target_temp(info.outdoor_temp);
-            // println!("Calculated target temp: {calculated_target}");
             let new_maxrate = match info.boiler_target_temp {
                 0..=110 => 21,
-                111..=125 => 21 + (info.boiler_target_temp - 110)*2,
+                111..=125 => 21 + (info.boiler_target_temp - 110) * 2,
                 _ => 96,
             };
             if new_maxrate != info.max_rate {
-                // println!("Adjusting maxrate to {new_maxrate}");
-                setreg(&mut ctx, BoilerField::MaxRate, new_maxrate).await?;
+                if opts.verbose {
+                    println!("Plan: set maxrate to {new_maxrate}");
+                }
+                if opts.control {
+                    setreg(&mut ctx, BoilerField::MaxRate, new_maxrate).await?;
+                }
+            }
+            // Current temp behavior:
+            // If indoor temp reaches 20.4375, thermostat seems to shut off.
+            // It can go as low as 19.6875 but probably turns on just a hair before that.
+            // So as we get close, back off the target temp by adjusting the outdoor reset offset.
+            if info.indoor_temp.is_some_and(|t| t >= 20.312) {
+                // Tweak the outdoor reset by a degree to aim for a smoother landing
+                let outdoor_boost = 2;
+                if opts.verbose {
+                    println!("Plan: set outdoor_temp_adjust to {outdoor_boost} because indoor temp is high enough");
+                }
+                if opts.control {
+                    setreg(&mut ctx, BoilerField::OdAdjust, outdoor_boost).await?;
+                }   
             }
         } else {
             // SAFETY: Turn the max rate back to normal in case anything goes really wrong
             // so that it's less likely to get stuck this way on a crash.
-            let maxrate = getreg(&mut ctx, BoilerField::MaxRate).await?;
-            if maxrate != 96 {
-                // println!("Adjusting maxrate back to 96 while boiler is off");
-                setreg(&mut ctx, BoilerField::MaxRate, 96).await?;
+            if info.max_rate != 96 {
+                if opts.verbose {
+                    println!("Plan: set max_rate from {} to 96 because boiler is off", info.max_rate);
+                }
+                if opts.control {
+                    setreg(&mut ctx, BoilerField::MaxRate, 96).await?;
+                }
+            }
+            if info.outdoor_temp_adjust != 0 {
+                if opts.verbose {
+                    println!("Plan: set outdoor temp adjust to 0 because boiler is off");
+                }
+                if opts.control {
+                    let r = setreg(&mut ctx, BoilerField::OdAdjust, 0).await;
+                    if let Err(e) = r {
+                        eprintln!("Error: {}", e);
+                    }
+                }
             }
         }
         return Ok(()); // Changed mind. Allowing the other processes to grab serial.
