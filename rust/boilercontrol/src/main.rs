@@ -241,11 +241,26 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             file.write_all(b"\n")?;
         }
         if info.boiler_status != 0 {
-            let new_maxrate = match info.boiler_target_temp {
+            let target_temp = match info.boiler_status {
+                131 => info.boiler_target_temp,
+                _ => calculate_target_temp(info.outdoor_temp),
+            };
+            let mut new_maxrate = match target_temp {
                 0..=110 => 21,
                 111..=125 => 21 + (info.boiler_target_temp - 110) * 2,
                 _ => 96,
             };
+            // Target-based control
+            // Current temp behavior:
+            // If indoor temp reaches 20.4375, thermostat seems to shut off.
+            // It can go as low as 19.6875 but probably turns on just a hair before that.
+            // So as we get close, back off the target temp by adjusting the outdoor reset offset.
+            if info.indoor_temp.is_some_and(|t| t >= 20.18) {
+                if opts.verbose {
+                    println!("Plan: set maxrate to 20 because indoor temp is 20.2C or higher");
+                }
+                new_maxrate = 21;
+            }
             if new_maxrate != info.max_rate {
                 if opts.verbose {
                     println!("Plan: set maxrate to {new_maxrate}");
@@ -254,29 +269,15 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
                     setreg(&mut ctx, BoilerField::MaxRate, new_maxrate).await?;
                 }
             }
-            // Current temp behavior:
-            // If indoor temp reaches 20.4375, thermostat seems to shut off.
-            // It can go as low as 19.6875 but probably turns on just a hair before that.
-            // So as we get close, back off the target temp by adjusting the outdoor reset offset.
-            if info.indoor_temp.is_some_and(|t| t >= 20.312) {
-                // Tweak the outdoor reset by a degree to aim for a smoother landing
-                let outdoor_boost = 2;
-                if opts.verbose {
-                    println!("Plan: set outdoor_temp_adjust to {outdoor_boost} because indoor temp is high enough");
-                }
-                if opts.control {
-                    setreg(&mut ctx, BoilerField::OdAdjust, outdoor_boost).await?;
-                }   
-            }
         } else {
             // SAFETY: Turn the max rate back to normal in case anything goes really wrong
             // so that it's less likely to get stuck this way on a crash.
-            if info.max_rate != 96 {
+            if info.max_rate < 50 {
                 if opts.verbose {
-                    println!("Plan: set max_rate from {} to 96 because boiler is off", info.max_rate);
+                    println!("Plan: set max_rate from {} to 50 because boiler is off", info.max_rate);
                 }
                 if opts.control {
-                    setreg(&mut ctx, BoilerField::MaxRate, 96).await?;
+                    setreg(&mut ctx, BoilerField::MaxRate, 50).await?;
                 }
             }
             if info.outdoor_temp_adjust != 0 {
