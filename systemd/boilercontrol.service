@@ -1,0 +1,14 @@
+[Unit]
+Description=Boiler Control
+After=network-online.target
+
+[Service]
+ExecStart=/home/dga/boilercontrol --control
+Restart=always
+RestartSec=1
+RuntimeDirectory=/home/dga/
+WorkingDirectory=/home/dga/
+User=dga
+
+[Install]
+WantedBy=multi-user.target
