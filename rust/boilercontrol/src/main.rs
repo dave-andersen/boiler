@@ -247,7 +247,7 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             };
             let mut new_maxrate = match target_temp {
                 0..=110 => 21,
-                111..=125 => 21 + (info.boiler_target_temp - 110) * 2,
+                111..=130 => 21 + ((info.boiler_target_temp - 110) as f32 * 1.5) as u16,
                 _ => 96,
             };
             // Target-based control
@@ -255,9 +255,10 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             // If indoor temp reaches 20.4375, thermostat seems to shut off.
             // It can go as low as 19.6875 but probably turns on just a hair before that.
             // So as we get close, back off the target temp by adjusting the outdoor reset offset.
-            if info.indoor_temp.is_some_and(|t| t >= 20.18) {
+            let temp_thresh = 19.8;
+            if info.indoor_temp.is_some_and(|t| t >= temp_thresh) {
                 if opts.verbose {
-                    println!("Plan: set maxrate to 20 because indoor temp is 20.2C or higher");
+                    println!("Plan: set maxrate to 20 because indoor temp is {temp_thresh}C or higher");
                 }
                 new_maxrate = 21;
             }
