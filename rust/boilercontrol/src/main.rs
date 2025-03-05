@@ -1,8 +1,8 @@
 use clap::Parser;
+use reqwest::Client;
 use serde::Serialize;
 use std::io::Write;
 use tokio_modbus::prelude::{Reader, Writer};
-use reqwest::Client;
 
 const REAL_SUPPLY_MIN: i32 = 85;
 const REAL_SUPPLY_MAX: i32 = 171;
@@ -35,6 +35,10 @@ struct Opts {
     /// Emit verbose output
     #[arg(short, long)]
     verbose: bool,
+
+    /// Logging host:port
+    #[arg(long)]
+    loghost: String,
 }
 
 // Modbus registers, specific to Weil-Mclain Evergreen
@@ -156,8 +160,19 @@ async fn timeout() {
 #[tokio::main]
 async fn main() {
     let opts: Opts = Opts::parse();
+    let loghost = opts.loghost.clone();
+    let socket = if !opts.loghost.is_empty() {
+        Some({
+            let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            socket.connect(&loghost).await.unwrap();
+            socket
+        })
+    } else {
+        None
+    };
     loop {
-        if let Err(e) = control_loop(&opts).await {
+        let logsocket = socket.as_ref();
+        if let Err(e) = control_loop(&opts, logsocket).await {
             eprintln!("Error: {}", e);
         }
         tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
@@ -211,7 +226,10 @@ async fn get_indoor_temp(opts: &Opts) -> Result<f32, Box<dyn std::error::Error>>
     Ok(resp.temp)
 }
 
-async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
+async fn control_loop(
+    opts: &Opts,
+    logsocket: Option<&tokio::net::UdpSocket>,
+) -> Result<(), Box<dyn std::error::Error>> {
     use tokio_serial::SerialStream;
 
     use tokio_modbus::prelude::*;
@@ -231,15 +249,26 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
         let mut info = get_full_boiler_info(&mut ctx).await?;
         info.indoor_temp = indoor_temp;
         let info_json = serde_json::to_string(&info)?;
-        // Log this to log.json
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open("log.json")
-        {
-            file.write_all(info_json.as_bytes())?;
-            file.write_all(b"\n")?;
+
+        // Either send to UDP socket or log to file
+        match logsocket {
+            Some(socket) => {
+                // Send via UDP to the log host
+                socket.send(info_json.as_bytes()).await?;
+            }
+            None => {
+                // Log this to log.json as before
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open("log.json")
+                {
+                    file.write_all(info_json.as_bytes())?;
+                    file.write_all(b"\n")?;
+                }
+            }
         }
+
         if info.boiler_status != 0 {
             let target_temp = match info.boiler_status {
                 131 => info.boiler_target_temp,
@@ -258,7 +287,9 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             let temp_thresh = 19.8;
             if info.indoor_temp.is_some_and(|t| t >= temp_thresh) {
                 if opts.verbose {
-                    println!("Plan: set maxrate to 20 because indoor temp is {temp_thresh}C or higher");
+                    println!(
+                        "Plan: set maxrate to 20 because indoor temp is {temp_thresh}C or higher"
+                    );
                 }
                 new_maxrate = 21;
             }
@@ -275,7 +306,10 @@ async fn control_loop(opts: &Opts) -> Result<(), Box<dyn std::error::Error>> {
             // so that it's less likely to get stuck this way on a crash.
             if info.max_rate < 50 {
                 if opts.verbose {
-                    println!("Plan: set max_rate from {} to 50 because boiler is off", info.max_rate);
+                    println!(
+                        "Plan: set max_rate from {} to 50 because boiler is off",
+                        info.max_rate
+                    );
                 }
                 if opts.control {
                     setreg(&mut ctx, BoilerField::MaxRate, 50).await?;
