@@ -1,7 +1,10 @@
 use clap::Parser;
+use pid::Pid;
 use reqwest::Client;
 use serde::Serialize;
 use std::io::Write;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tokio_modbus::prelude::{Reader, Writer};
 
 const REAL_SUPPLY_MIN: i32 = 85;
@@ -31,6 +34,10 @@ struct Opts {
     /// Temperature sensor IP address
     #[arg(long, default_value = "192.168.49.11")]
     sensor_ip: String,
+
+    /// Override min max modulation rate
+    #[arg(long)]
+    override_min_max: Option<u16>,
 
     /// Emit verbose output
     #[arg(short, long)]
@@ -172,10 +179,14 @@ async fn main() {
     };
     loop {
         let logsocket = socket.as_ref();
-        if let Err(e) = control_loop(&opts, logsocket).await {
-            eprintln!("Error: {}", e);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(30000)).await;
+        let sleep_duration = match control_loop(&opts, logsocket).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                30000
+            }
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_duration)).await;
     }
 }
 
@@ -226,10 +237,12 @@ async fn get_indoor_temp(opts: &Opts) -> Result<f32, Box<dyn std::error::Error>>
     Ok(resp.temp)
 }
 
+static pid_cell: OnceLock<Mutex<Pid<f32>>> = OnceLock::new();
+
 async fn control_loop(
     opts: &Opts,
     logsocket: Option<&tokio::net::UdpSocket>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(u64), Box<dyn std::error::Error>> {
     use tokio_serial::SerialStream;
 
     use tokio_modbus::prelude::*;
@@ -243,6 +256,15 @@ async fn control_loop(
     let port = SerialStream::open(&builder).unwrap();
 
     let mut ctx = rtu::attach_slave(port, slave);
+
+    // A static PID controller that hangs out forever
+    {
+        let _pid = pid_cell.get_or_init(|| {
+            let mut p = Pid::<f32>::new(19.875, 80.0);
+            p.p(1.0, 100.0).i(1.0, 100.0).d(1.0, 100.0);
+            Mutex::new(p)
+        });
+    }
 
     loop {
         let indoor_temp = get_indoor_temp(&opts).await.ok();
@@ -276,7 +298,7 @@ async fn control_loop(
             };
             let mut new_maxrate = match target_temp {
                 0..=110 => 21,
-                111..=130 => 21 + ((info.boiler_target_temp - 110) as f32 * 1.5) as u16,
+                111..=160 => 21 + ((info.boiler_target_temp - 110) as f32 * 1.0) as u16,
                 _ => 96,
             };
             // Target-based control
@@ -284,14 +306,40 @@ async fn control_loop(
             // If indoor temp reaches 20.4375, thermostat seems to shut off.
             // It can go as low as 19.6875 but probably turns on just a hair before that.
             // So as we get close, back off the target temp by adjusting the outdoor reset offset.
-            let temp_thresh = 19.8;
+            let temp_thresh = 19.6;
             if info.indoor_temp.is_some_and(|t| t >= temp_thresh) {
+                let t = info.indoor_temp.unwrap();
                 if opts.verbose {
-                    println!(
-                        "Plan: set maxrate to 20 because indoor temp is {temp_thresh}C or higher"
-                    );
+                    println!("Plan: Invoke PID controller");
                 }
-                new_maxrate = 21;
+                let control_output = if new_maxrate > 24 {
+                    pid_cell
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .next_control_output(t)
+                        .output
+                } else {
+                    pid_cell
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .reset_integral_term();
+                    new_maxrate as f32 - 21.0
+                };
+                let mut try_maxrate = (21.0 + control_output).floor() as u16;
+                try_maxrate = std::cmp::max(21, try_maxrate);
+                try_maxrate = std::cmp::min(try_maxrate, new_maxrate);
+                println!("PID reult: {control_output}, setting maxrate to {try_maxrate}");
+                new_maxrate = try_maxrate;
+            }
+            if let Some(override_val) = opts.override_min_max {
+                if opts.verbose {
+                    println!("Plan: override min maxrate to {override_val}");
+                }
+                new_maxrate = override_val;
             }
             if new_maxrate != info.max_rate {
                 if opts.verbose {
@@ -304,6 +352,13 @@ async fn control_loop(
         } else {
             // SAFETY: Turn the max rate back to normal in case anything goes really wrong
             // so that it's less likely to get stuck this way on a crash.
+            pid_cell
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .reset_integral_term();
+
             if info.max_rate < 50 {
                 if opts.verbose {
                     println!(
@@ -327,7 +382,10 @@ async fn control_loop(
                 }
             }
         }
-        return Ok(()); // Changed mind. Allowing the other processes to grab serial.
+        if info.indoor_temp.is_some_and(|t| t > 72.0) || info.outdoor_temp > 70 {
+            return Ok(300 * 1000); // sleep for 5 minutes
+        }
+        return Ok(30 * 1000); // Changed mind. Allowing the other processes to grab serial.
     }
-    Ok(())
+    Ok(30000)
 }
