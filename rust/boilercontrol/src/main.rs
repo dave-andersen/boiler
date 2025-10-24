@@ -1,10 +1,12 @@
 use clap::Parser;
 use pid::Pid;
-use reqwest::Client;
 use serde::Serialize;
 use std::io::Write;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use esphome_client::types::{EspHomeMessage, SubscribeStatesRequest};
+use esphome_client::EspHomeClient;
+use std::sync::Arc;
 use tokio_modbus::prelude::{Reader, Writer};
 
 const REAL_SUPPLY_MIN: i32 = 85;
@@ -177,9 +179,72 @@ async fn main() {
     } else {
         None
     };
+
+    // Read API key once at startup
+    let api_key = match read_api_key().await {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!("Failed to read API key: {}", e);
+            panic!("Cannot continue without API key");
+        }
+    };
+
+    // Initialize ESPHome temperature cache - just stores the latest temp
+    let esp_temp: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
+    let esp_temp_clone = esp_temp.clone();
+
+    // Spawn a task to manage ESPHome connection and read temperature updates
+    tokio::spawn(async move {
+        loop {
+            match EspHomeClient::builder()
+                .address("192.168.49.11:6053")
+                .key(&api_key)
+                .connect()
+                .await
+            {
+                Ok(mut client) => {
+
+                    // Subscribe to state updates
+                    if let Err(e) = client.try_write(SubscribeStatesRequest {}).await {
+                        eprintln!("Failed to subscribe to states: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+                        continue;
+                    }
+
+                    // Read messages continuously until connection fails
+                    loop {
+                        match client.try_read().await {
+                            Ok(message) => {
+                                if let EspHomeMessage::SensorStateResponse(response) = message {
+                                    // Update the cached temperature
+                                    *esp_temp_clone.lock().unwrap() = Some(response.state);
+                                }
+                                // Continue reading other message types
+                            }
+                            Err(e) => {
+                                eprintln!("Error reading from ESPHome: {}", e);
+                                *esp_temp_clone.lock().unwrap() = None;
+                                break; // Break inner loop to reconnect
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to ESPHome: {}", e);
+                    *esp_temp_clone.lock().unwrap() = None;
+                }
+            }
+            // Retry connection every 5 seconds if it fails
+            tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
+        }
+    });
+
+    // Give the ESPHome client a moment to connect
+    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+
     loop {
         let logsocket = socket.as_ref();
-        let sleep_duration = match control_loop(&opts, logsocket).await {
+        let sleep_duration = match control_loop(&opts, logsocket, &esp_temp).await {
             Ok(n) => n,
             Err(e) => {
                 eprintln!("Error: {}", e);
@@ -221,20 +286,28 @@ async fn setreg(
 }
 
 #[derive(serde::Deserialize)]
-struct TempResponse {
-    temp: f32, // in C
+struct ApiKeyConfig {
+    key: String,
 }
 
-async fn get_indoor_temp(opts: &Opts) -> Result<f32, Box<dyn std::error::Error>> {
-    let client = Client::new();
-    // Build a request with a 1 second timeout
-    let req = client
-        .get(format!("http://{}/", opts.sensor_ip))
-        .timeout(std::time::Duration::from_secs(1));
-    let resp = req.send().await?;
-    // unmarshal from json TempResponse
-    let resp: TempResponse = resp.json().await?;
-    Ok(resp.temp)
+async fn read_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    let home = std::env::var("HOME")?;
+    let key_path = format!("{}/.espkey", home);
+    let contents = tokio::fs::read_to_string(&key_path).await?;
+    let config: ApiKeyConfig = serde_json::from_str(&contents)?;
+    Ok(config.key)
+}
+
+async fn get_indoor_temp(
+    temp_cache: &Arc<Mutex<Option<f32>>>,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    let temp_guard = temp_cache.lock().unwrap(); // .await;
+
+    if let Some(temp) = *temp_guard {
+        Ok(temp)
+    } else {
+        Err("ESPHome temperature not available".into())
+    }
 }
 
 static pid_cell: OnceLock<Mutex<Pid<f32>>> = OnceLock::new();
@@ -242,6 +315,7 @@ static pid_cell: OnceLock<Mutex<Pid<f32>>> = OnceLock::new();
 async fn control_loop(
     opts: &Opts,
     logsocket: Option<&tokio::net::UdpSocket>,
+    esp_temp: &Arc<Mutex<Option<f32>>>,
 ) -> Result<(u64), Box<dyn std::error::Error>> {
     use tokio_serial::SerialStream;
 
@@ -267,7 +341,7 @@ async fn control_loop(
     }
 
     loop {
-        let indoor_temp = get_indoor_temp(&opts).await.ok();
+        let indoor_temp = get_indoor_temp(esp_temp).await.ok();
         let mut info = get_full_boiler_info(&mut ctx).await?;
         info.indoor_temp = indoor_temp;
         let info_json = serde_json::to_string(&info)?;
