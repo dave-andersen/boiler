@@ -1,4 +1,0 @@
-[toolchain]
-targets = [
-    "arm-unknown-linux-gnueabihf"
-]

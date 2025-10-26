@@ -10,7 +10,7 @@ anyhow = "1.0"
 chrono = "0.4.31"
 clap = { version = "4.4.11", features = ["derive"] }
 pid = "4.0.0"
-esphome-client = { path = "/Users/dga/esphome/esphome-client" }
+esphome-client = { path = "/home/dga/esphome/esphome-client" }
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = "1.0.108"
 tokio = { version = "1.34.0", features = ["time", "fs", "sync"] }

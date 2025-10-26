@@ -18,7 +18,7 @@ const MAX_TEMP_DELTA: i32 = 6;
 #[derive(Parser, Debug)]
 struct Opts {
     /// Serial device to use
-    #[arg(short, long, default_value = "/dev/serial0")]
+    #[arg(short, long, default_value = "/dev/ttyUSB0")]
     serial: String,
 
     /// Serial port speed
