@@ -45,9 +45,13 @@ struct Opts {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Logging host:port
-    #[arg(long)]
+    /// Logging host:port (UDP socket)
+    #[arg(long, default_value = "")]
     loghost: String,
+
+    /// Log file path (append mode)
+    #[arg(long)]
+    logfile: Option<String>,
 }
 
 // Modbus registers, specific to Weil-Mclain Evergreen
@@ -193,15 +197,28 @@ async fn main() {
     let esp_temp: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
     let esp_temp_clone = esp_temp.clone();
 
+    // Track last successful temperature reading time for watchdog
+    let last_reading_time: Arc<Mutex<std::time::Instant>> =
+        Arc::new(Mutex::new(std::time::Instant::now()));
+    let last_reading_clone = last_reading_time.clone();
+
     // Spawn a task to manage ESPHome connection and read temperature updates
     tokio::spawn(async move {
         loop {
-            match EspHomeClient::builder()
-                .address("192.168.49.11:6053")
-                .key(&api_key)
-                .connect()
-                .await
-            {
+            // The library's own timeout only covers the TCP/noise connect, not the
+            // Hello/Connect handshake, so bound the whole thing here.
+            let connect_result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                EspHomeClient::builder()
+                    .address("192.168.49.11:6053")
+                    .key(&api_key)
+                    .connect(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(esphome_client::error::ClientError::Timeout { timeout_ms: 30000 })
+            });
+            match connect_result {
                 Ok(mut client) => {
 
                     // Subscribe to state updates
@@ -210,22 +227,54 @@ async fn main() {
                         tokio::time::sleep(std::time::Duration::from_millis(5000)).await;
                         continue;
                     }
+                    eprintln!("Connected to ESPHome, subscribed to states");
+
+                    // Restart the watchdog for this connection. Without this, after any
+                    // outage longer than 60s the stale timestamp makes the check below
+                    // fire before the first read, so every reconnect was torn down
+                    // immediately and the loop never recovered.
+                    *last_reading_clone.lock().unwrap() = std::time::Instant::now();
 
                     // Read messages continuously until connection fails
                     loop {
-                        match client.try_read().await {
-                            Ok(message) => {
-                                if let EspHomeMessage::SensorStateResponse(response) = message {
-                                    // Update the cached temperature
-                                    *esp_temp_clone.lock().unwrap() = Some(response.state);
+                        // Check if we haven't had a successful reading in over 60 seconds
+                        let time_since_last_reading = last_reading_clone.lock().unwrap().elapsed();
+                        if time_since_last_reading > std::time::Duration::from_secs(60) {
+                            eprintln!("No temperature reading for {} seconds, forcing reconnect",
+                                time_since_last_reading.as_secs());
+                            *esp_temp_clone.lock().unwrap() = None;
+                            break; // Break inner loop to reconnect
+                        }
+
+                        // Use select with timeout to detect hung connections
+                        let timed_out = tokio::select! {
+                            // Timeout individual reads at 60 seconds to detect stuck connections
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                                true
+                            }
+                            result = client.try_read() => {
+                                match result {
+                                    Ok(message) => {
+                                        if let EspHomeMessage::SensorStateResponse(response) = message {
+                                            // Update the cached temperature and timestamp
+                                            *esp_temp_clone.lock().unwrap() = Some(response.state);
+                                            *last_reading_clone.lock().unwrap() = std::time::Instant::now();
+                                        }
+                                        // Continue reading other message types
+                                        false
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error reading from ESPHome: {}", e);
+                                        *esp_temp_clone.lock().unwrap() = None;
+                                        true // Signal to break
+                                    }
                                 }
-                                // Continue reading other message types
                             }
-                            Err(e) => {
-                                eprintln!("Error reading from ESPHome: {}", e);
-                                *esp_temp_clone.lock().unwrap() = None;
-                                break; // Break inner loop to reconnect
-                            }
+                        };
+
+                        if timed_out {
+                            eprintln!("ESPHome connection timed out or error occurred, reconnecting");
+                            break; // Break inner loop to reconnect
                         }
                     }
                 }
@@ -244,10 +293,11 @@ async fn main() {
 
     loop {
         let logsocket = socket.as_ref();
-        let sleep_duration = match control_loop(&opts, logsocket, &esp_temp).await {
+        let logfile = opts.logfile.as_deref();
+        let sleep_duration = match control_loop(&opts, logsocket, logfile, &esp_temp).await {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("Error: {}", e);
+                eprintln!("Control Loop Error: {}", e);
                 30000
             }
         };
@@ -315,6 +365,7 @@ static pid_cell: OnceLock<Mutex<Pid<f32>>> = OnceLock::new();
 async fn control_loop(
     opts: &Opts,
     logsocket: Option<&tokio::net::UdpSocket>,
+    logfile: Option<&str>,
     esp_temp: &Arc<Mutex<Option<f32>>>,
 ) -> Result<(u64), Box<dyn std::error::Error>> {
     use tokio_serial::SerialStream;
@@ -346,22 +397,20 @@ async fn control_loop(
         info.indoor_temp = indoor_temp;
         let info_json = serde_json::to_string(&info)?;
 
-        // Either send to UDP socket or log to file
-        match logsocket {
-            Some(socket) => {
-                // Send via UDP to the log host
-                socket.send(info_json.as_bytes()).await?;
-            }
-            None => {
-                // Log this to log.json as before
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open("log.json")
-                {
-                    file.write_all(info_json.as_bytes())?;
-                    file.write_all(b"\n")?;
-                }
+        // Log to UDP socket if configured
+        if let Some(socket) = logsocket {
+            socket.send(info_json.as_bytes()).await?;
+        }
+
+        // Log to file if configured
+        if let Some(file_path) = logfile {
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(file_path)
+            {
+                file.write_all(info_json.as_bytes())?;
+                file.write_all(b"\n")?;
             }
         }
 
